@@ -1,0 +1,50 @@
+[package]
+name = "iax2"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Mariano 'Qhawaq' Mancini"]
+description = "Native Rust implementation of the Inter-Asterisk eXchange v2 (IAX2, RFC 5456) protocol: sans-io core with MD5 auth and call-token, G.711 codec and an adaptive jitter buffer, plus an optional async UDP driver and cross-platform audio."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Qhawaq/iax2"
+documentation = "https://docs.rs/iax2"
+keywords = ["iax", "iax2", "asterisk", "voip", "telephony"]
+categories = ["network-programming", "multimedia::audio"]
+readme = "README.md"
+
+
+[features]
+default = []
+net = ["dep:tokio"]                       # driver UDP async (binari)
+dsp = ["dep:rubato"]                       # resampling polifase
+audio = ["dsp", "net", "dep:cpal"]         # I/O audio cross-platform (cpal)
+
+[lib]
+name = "iax2"
+path = "src/lib.rs"
+
+[[bin]]
+name = "regtest"
+path = "src/bin/regtest.rs"
+required-features = ["net"]
+
+[[bin]]
+name = "calltest"
+path = "src/bin/calltest.rs"
+required-features = ["audio"]
+
+[[bin]]
+name = "regdaemon"
+path = "src/bin/regdaemon.rs"
+required-features = ["audio"]
+
+[[bin]]
+name = "softphone"
+path = "src/bin/softphone.rs"
+required-features = ["audio"]
+
+[dependencies]
+md5 = "0.7"
+tokio = { version = "1", features = ["net", "rt", "macros", "time", "sync", "io-std", "io-util"], optional = true }
+rubato = { version = "=0.15.0", optional = true }
+cpal = { version = "0.15", optional = true }

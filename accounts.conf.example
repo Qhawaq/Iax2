@@ -1,0 +1,23 @@
+# softphone — Config file
+# Just one section for each pbx you want to register to: config label [Name] is using as call appearance
+#
+# Start:  softphone accounts.conf
+#
+# Section keys:
+#   host     PBX hostname or IP         (required)
+#   user     extension/user IAX2        (required)
+#   secret   password                   (required)
+#   port     UDP port IAX2 channel      (default: 4569)
+#   refresh  re-REGISTER interval secs. (default: 60)
+
+[Pbx1]
+host   = <pbx1 fqdn or IP>
+port   = 4569
+user   = 100
+secret = Change-Me
+
+[Pbx2]
+host   = <pbx2 fqdn or IP>
+user   = 100
+secret = Change-Me
+refresh = 90

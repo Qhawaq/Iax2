@@ -67,15 +67,15 @@ impl App {
         loop {
             let Some(ev) = self.clients[idx].poll_event() else { break };
             match ev {
-                Event::Registered => println!("[\u{2713}] [{name}] REGISTRATO"),
-                Event::RegisterLost { reason } => println!("[!] [{name}] registrazione persa: {reason}"),
+                Event::Registered => println!("[\u{2713}] [{name}] REGISTERED"),
+                Event::RegisterLost { reason } => println!("[!] [{name}] lost registration: {reason}"),
                 Event::Incoming { call, from, to } => {
-                    println!("[\u{260E}] [{name}] CHIAMATA IN ARRIVO #{call} da '{from}' verso '{to}'  —  premi 'a' per rispondere");
+                    println!("[\u{260E}] [{name}] INCOMING CALL #{call} from '{from}' to '{to}'  —  press 'a'+<ENTER> to answer");
                 }
                 Event::Dialing { call, to } => println!("[>] [{name}] chiamo '{to}' (#{call})"),
-                Event::Ringing { call } => println!("[i] [{name}] #{call} sta squillando…"),
+                Event::Ringing { call } => println!("[i] [{name}] #{call} is ringing ..."),
                 Event::Answered { call } => {
-                    println!("[\u{2713}] [{name}] #{call} connessa — audio attivo");
+                    println!("[\u{2713}] [{name}] #{call} connected — audio on");
                     // diventa la chiamata attiva; metti in attesa le altre Up
                     self.make_active(idx, call).await;
                 }
@@ -85,7 +85,7 @@ impl App {
                     }
                 }
                 Event::Ended { call, reason } => {
-                    println!("[i] [{name}] #{call} terminata: {reason}");
+                    println!("[i] [{name}] #{call} ended: {reason}");
                     if self.active == Some((idx, call)) {
                         self.active = None;
                         self.jb.reset();
@@ -93,7 +93,7 @@ impl App {
                         self.audio.flush();
                     }
                 }
-                Event::Dtmf { call, digit } => println!("[#] [{name}] #{call} DTMF ricevuto: {digit}"),
+                Event::Dtmf { call, digit } => println!("[#] [{name}] #{call} DTMF received: {digit}"),
                 Event::Log(s) => println!("[i] [{name}] {s}"),
                 _ => {}
             }
@@ -210,7 +210,7 @@ impl App {
     }
 
     fn list(&self) {
-        println!("--- PBX ---");
+        println!("--- PBXes List ---");
         for (i, c) in self.clients.iter().enumerate() {
             let sel = if i == self.selected { "*" } else { " " };
             let reg = if c.is_registered() { "OK" } else { "--" };
@@ -218,17 +218,17 @@ impl App {
         }
         let calls = self.calls_index();
         if calls.is_empty() {
-            println!("--- nessuna chiamata in corso ---");
+            println!("--- No active calls online ---");
             return;
         }
-        println!("--- chiamate (premi il numero per renderla attiva) ---");
+        println!("--- CALLS (press call IDnum+<ENTER> to connect the call) ---");
         for (n, (idx, call)) in calls.iter().enumerate() {
             let c = &self.clients[*idx];
             let st = match c.call_state(*call) {
-                Some(CallState::Trying) => "in connessione",
-                Some(CallState::Ringing) => "squilla",
-                Some(CallState::Up) => "in linea",
-                Some(CallState::Held) => "in attesa",
+                Some(CallState::Trying) => "trying",
+                Some(CallState::Ringing) => "ringing",
+                Some(CallState::Up) => "on line",
+                Some(CallState::Held) => "on hold",
                 None => "?",
             };
             let peer = c.call_peer(*call).unwrap_or("?");
@@ -252,7 +252,7 @@ async fn main() {
         match parse_accounts(&args[1]) {
             Ok(a) if !a.is_empty() => a,
             Ok(_) => {
-                eprintln!("[x] nessun account nel file");
+                eprintln!("[x] no account in file");
                 std::process::exit(2);
             }
             Err(e) => {
@@ -262,7 +262,7 @@ async fn main() {
         }
     } else {
         if args.len() < 4 {
-            eprintln!("uso singolo account: {} <host> <user> <secret> [port] [refresh] [nome]", args[0]);
+            eprintln!("use single account: {} <host> <user> <secret> [port] [refresh] [nome]", args[0]);
             std::process::exit(2);
         }
         let host = args[1].clone();
@@ -279,7 +279,7 @@ async fn main() {
     let audio = match AudioIo::new() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[x] audio non disponibile: {e}");
+            eprintln!("[x] audio not available: {e}");
             std::process::exit(1);
         }
     };
@@ -302,7 +302,7 @@ async fn main() {
             eprintln!("[x] connect {remote}: {e}");
             std::process::exit(1);
         }
-        println!("[i] [{}] {} -> {remote} (utente {})", acc.cfg.name, sock.local_addr().unwrap(), acc.cfg.username);
+        println!("[i] [{}] {} -> {remote} (user {})", acc.cfg.name, sock.local_addr().unwrap(), acc.cfg.username);
         let sock = Arc::new(sock);
         let reader = sock.clone();
         let txc = tx.clone();
@@ -326,7 +326,19 @@ async fn main() {
 
     let mut app = App { clients, sockets, audio, active: None, selected: 0, jb: JitterBuffer::new(), last_pcm: Vec::new() };
 
-    println!("[i] pronto. comandi: a=rispondi  h=riaggancia  d <num>=chiama  p <n>=seleziona PBX  <n>=attiva chiamata  l=lista  q=esci");
+    println!("[i] READY.");
+    println!("[i] --------------------------------------------");
+    println!("[i] COMMAND KEYS ( press key+<ENTER> ) :");
+    println!("[i]   a           - Answer a call");
+    println!("[i]   h           - Hangup");
+    println!("[i]   d <num>     - Call <num>"); 
+    println!("[i]   p <n>       - Select  PBX"); 
+    println!("[i]   <n>         - Connect to call <n> "); 
+    println!("[i]   l           - Get calls/Pbxes list"); 
+    println!("[!]   t <digits>  - Send digit(s)  (0-9 * # A-D)");
+    println!("[i]   q           - Quit");
+    println!("[i] --------------------------------------------");
+    println!(" ");
 
     let mut audio_tick = interval(Duration::from_millis(20));
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -380,7 +392,7 @@ async fn main() {
             }
         }
     }
-    println!("[i] uscita.");
+    println!("[i] exit.");
 }
 
 impl App {
@@ -395,18 +407,18 @@ impl App {
                 if let Some(n) = it.next().and_then(|s| s.parse::<usize>().ok()) {
                     if n >= 1 && n <= self.clients.len() {
                         self.selected = n - 1;
-                        println!("[i] PBX selezionato: {}", self.clients[self.selected].name());
+                        println!("[i] selected PBX: {}", self.clients[self.selected].name());
                     }
                 }
             }
             "d" => {
                 let number = it.collect::<Vec<_>>().join(" ");
                 if number.is_empty() {
-                    println!("[!] uso: d <numero>");
+                    println!("[!] use: d <num>");
                 } else {
                     let idx = self.selected;
                     if !self.clients[idx].is_registered() {
-                        println!("[!] [{}] non registrato; provo lo stesso", self.clients[idx].name());
+                        println!("[!] [{}] not registered; I'll try anyway", self.clients[idx].name());
                     }
                     self.clients[idx].handle_command(Command::Dial { number }, now);
                     self.flush_tx(idx).await;
@@ -420,23 +432,23 @@ impl App {
                     self.flush_tx(idx).await;
                     self.handle_events(idx).await;
                 } else {
-                    println!("[!] nessuna chiamata che squilla");
+                    println!("[!] no calls are ringing");
                 }
             }
             "t" => {
                 // invia cifre DTMF sulla chiamata attiva
                 let digits = it.collect::<Vec<_>>().join("");
                 if digits.is_empty() {
-                    println!("[!] uso: t <cifre>   (0-9 * # A-D)");
+                    println!("[!] use: t <cifre>   (0-9 * # A-D)");
                 } else if let Some((idx, call)) = self.active {
                     for d in digits.chars() {
                         self.clients[idx].handle_command(Command::Dtmf { call, digit: d }, now);
                     }
                     self.flush_tx(idx).await;
                     self.handle_events(idx).await;
-                    println!("[i] DTMF inviati: {digits}");
+                    println!("[i] DTMF trasmitted: {digits}");
                 } else {
-                    println!("[!] nessuna chiamata attiva");
+                    println!("[!] no active call");
                 }
             }
             "h" => {
@@ -447,7 +459,7 @@ impl App {
                     self.active = None;
                     self.audio.flush();
                 } else {
-                    println!("[!] nessuna chiamata attiva");
+                    println!("[!] no active call");
                 }
             }
             other => {
@@ -456,9 +468,9 @@ impl App {
                 if let Ok(n) = key.parse::<usize>() {
                     let calls = self.calls_index();
                     if calls.is_empty() {
-                        println!("[!] nessuna chiamata in corso");
+                        println!("[!] no active call");
                     } else if n < 1 || n > calls.len() {
-                        println!("[!] indice fuori range: usa 1..{} ('l' per la lista)", calls.len());
+                        println!("[!] index out of range: use 1..{} ('l' to get full list)", calls.len());
                     } else {
                         let (idx, call) = calls[n - 1];
                         match self.clients[idx].call_state(call) {
@@ -472,11 +484,11 @@ impl App {
                                 self.make_active(idx, call).await;
                                 println!("[i] attiva: [{}] #{call}", self.clients[idx].name());
                             }
-                            None => println!("[!] la chiamata {n} non c'e' piu'"),
+                            None => println!("[!] Call {n} is not here"),
                         }
                     }
                 } else {
-                    println!("[!] comando sconosciuto: {other}");
+                    println!("[!] unknown command: {other}");
                 }
             }
         }
@@ -504,9 +516,9 @@ fn parse_accounts(path: &str) -> Result<Vec<Account>, String> {
 
     let flush = |cur: &mut Option<(String, HashMap<String, String>)>, out: &mut Vec<Account>| -> Result<(), String> {
         if let Some((name, kv)) = cur.take() {
-            let host = kv.get("host").cloned().ok_or_else(|| format!("[{name}] manca host"))?;
-            let user = kv.get("user").cloned().ok_or_else(|| format!("[{name}] manca user"))?;
-            let secret = kv.get("secret").cloned().ok_or_else(|| format!("[{name}] manca secret"))?;
+            let host = kv.get("host").cloned().ok_or_else(|| format!("[{name}] missing host"))?;
+            let user = kv.get("user").cloned().ok_or_else(|| format!("[{name}] missing user"))?;
+            let secret = kv.get("secret").cloned().ok_or_else(|| format!("[{name}] missing secret"))?;
             let port = kv.get("port").and_then(|s| s.parse().ok()).unwrap_or(IAX_PORT_DEFAULT);
             let refresh = kv.get("refresh").and_then(|s| s.parse().ok()).unwrap_or(60);
             let mut cfg = Config::new(name, user, secret);

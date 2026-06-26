@@ -1,41 +1,11 @@
 //! softphone — driver multilinea / multi-PBX.
 //!
-//! Possiede N `iax2::PbxClient` (uno per account/PBX), N socket UDP (uno per
-//! PBX: spazio call-number isolato, niente NAT tra peer sull'overlay) e UN solo
-//! motore audio. Instrada il microfono verso la chiamata ATTIVA e riproduce
-//! solo l'audio di quella. Le altre restano "in attesa" (call waiting).
-//!
-//! Tutta la logica di protocollo sta nel core sans-io `iax2::client`; qui c'e'
-//! solo I/O: socket, audio, tastiera.
-//!
 //! ## Uso
 //! Singolo account (compatibile con regdaemon):
 //!   softphone <host> <user> <secret> [port] [refresh] [nome]
 //! Multi-account da file:
 //!   softphone accounts.conf
 //!
-//! Formato file (INI minimale):
-//!   [Catania]
-//!   host = pbxctcatania.magaldinnova.tech
-//!   port = 4569
-//!   user = 10001
-//!   secret = xxxxx
-//!   refresh = 60
-//!
-//!   [Salerno]
-//!   host = 10.10.9.1
-//!   user = 10001
-//!   secret = yyyyy
-//!
-//! ## Comandi da tastiera (una riga + invio)
-//!   a            rispondi alla prima chiamata che squilla
-//!   h            riaggancia la chiamata attiva
-//!   d <num>      componi <num> sul PBX selezionato
-//!   t <cifre>    invia DTMF (0-9 * # A-D) sulla chiamata attiva
-//!   p <n>        seleziona il PBX n (per comporre)   [1-based]
-//!   <n>          rendi attiva la chiamata n della lista   [1-based]
-//!   l            elenca PBX e chiamate
-//!   q            esci
 
 use std::collections::HashMap;
 use std::env;

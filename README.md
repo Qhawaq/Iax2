@@ -17,6 +17,9 @@ without leaving the crate.
 > work against real hardware. The public API is not yet stable and the codec
 > support is intentionally narrow (see [Scope](#scope-and-limitations)).
 
+> **New in 0.2.0:** Added DTMF support
+
+
 ## What works
 
 - **Registration** with call-token pre-authentication and MD5 challenge/response

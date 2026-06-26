@@ -1,9 +1,9 @@
 [package]
 name = "iax2"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
-authors = ["Mariano 'Qhawaq' Mancini"]
+authors = ["Mariano (Qhawaq)"]
 description = "Native Rust implementation of the Inter-Asterisk eXchange v2 (IAX2, RFC 5456) protocol: sans-io core with MD5 auth and call-token, G.711 codec and an adaptive jitter buffer, plus an optional async UDP driver and cross-platform audio."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Qhawaq/iax2"
@@ -11,7 +11,6 @@ documentation = "https://docs.rs/iax2"
 keywords = ["iax", "iax2", "asterisk", "voip", "telephony"]
 categories = ["network-programming", "multimedia::audio"]
 readme = "README.md"
-
 
 [features]
 default = []

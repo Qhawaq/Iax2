@@ -31,6 +31,8 @@ without leaving the crate.
   network jitter (RFC 3550 estimate), and reports gaps for packet-loss concealment
 - **G.711 µ-law** codec, with optional polyphase resampling to/from the device rate
 - **LAGRQ/LAGRP** lag measurement and **comfort-noise** handling
+- **DTMF** send and receive (RFC 5456 DTMF frames). Sending the feature codes
+  your PBX expects lets you reach server-side features such as call transfer.
 
 ## Architecture
 
@@ -117,8 +119,8 @@ Built with `--features audio` (or `net` for the diagnostic-only one):
 | `softphone` | `audio` | multi-line / multi-PBX softphone (keyboard-driven)    |
 
 The `softphone` registers against one or more PBXes (one account each), rings on
-inbound calls, supports call waiting across PBXes, hold/unhold and call
-switching, and runs the adaptive jitter buffer on the active call.
+inbound calls, supports call waiting across PBXes, hold/unhold, call switching
+and DTMF, and runs the adaptive jitter buffer on the active call.
 
 ```text
 softphone <host> <user> <secret> [port] [refresh] [name]   # single account
@@ -158,7 +160,9 @@ This crate is a focused, honest implementation — not a full IAX2 stack:
 
 - **Codec**: G.711 µ-law only. No A-law, GSM, G.729 or other formats yet.
 - **No** video, text messages, or trunked (meta) frames.
-- **No** DTMF send/receive surfaced in the high-level API yet.
+- **Call transfer** is done through PBX feature codes (sent as DTMF), not via the
+  IAX2 native transfer (TXREQ/TXMEDIA) media-path optimization, which is not
+  implemented.
 - **No** acoustic echo cancellation — use a headset, or wire your own AEC into
   the audio layer (the playout reference and capture frames are both exposed).
 - Validated with `requirecalltoken=yes`, `ulaw`, `from-internal`. Other

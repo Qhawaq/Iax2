@@ -1,5 +1,30 @@
 //! `client` — macchina a stati IAX2 **sans-io** per UN account su UN PBX.
 //!
+//! Nessun socket, nessun tokio, nessun audio: solo byte in / byte out / eventi.
+//! Il driver (binario) possiede N `PbxClient` (uno per PBX), N socket UDP e un
+//! solo motore audio, e fa da collante. Questo permette:
+//! - registrazioni in parallelo (un account per PBX),
+//! - piu' chiamate concorrenti con allocazione dinamica del call number,
+//! - affidabilita' **per-leg** (finestra con ACK cumulativo), non piu' un
+//!   `pending` globale stop-and-wait,
+//! - qualify con call number **rotante** (niente NOTICE "Still have a callno").
+//!
+//! Tutta la conoscenza dura conquistata sul campo (token fresco a ogni ciclo,
+//! PONG che riecheggia il timestamp del POKE, split media/comando nel decode,
+//! keepalive NAT) e' preservata: vedi i commenti `LEZIONE`.
+//!
+//! ## Modello d'uso (sans-io)
+//! ```ignore
+//! let mut c = PbxClient::new(cfg);
+//! loop {
+//!     // 1) consegna l'output: c.poll_transmit() -> datagrammi per QUESTO pbx
+//!     // 2) reagisci al tempo:  c.handle_timeout(now)
+//!     // 3) consegna input:     c.handle_input(&datagram, now)
+//!     // 4) dai comandi:        c.handle_command(Command::Answer{call}, now)
+//!     // 5) leggi eventi:       while let Some(ev) = c.poll_event() { ... }
+//!     // 6) prossimo risveglio: c.poll_timeout()
+//! }
+//! ```
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -78,6 +103,7 @@ impl Config {
 // === eventi verso il driver =================================================
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Event {
     /// Registrazione completata (REGACK).
     Registered,
@@ -95,6 +121,8 @@ pub enum Event {
     Voice { call: u16, ts: u32, ulaw: Vec<u8> },
     /// Chiamata terminata (HANGUP/REJECT/BUSY/timeout affidabilita').
     Ended { call: u16, reason: String },
+    /// Cifra DTMF ricevuta dal remoto.
+    Dtmf { call: u16, digit: char },
     /// Diagnostica (passthrough dei vecchi log `[i]`).
     Log(String),
 }
@@ -102,6 +130,7 @@ pub enum Event {
 // === comandi dal driver =====================================================
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Command {
     /// Componi un numero (chiamata uscente).
     Dial { number: String },
@@ -115,6 +144,8 @@ pub enum Command {
     Unhold { call: u16 },
     /// Invia un frame audio (payload G.711 µ-law gia' codificato dal driver).
     SendVoice { call: u16, ulaw: Vec<u8> },
+    /// Invia una cifra DTMF (0-9, *, #, A-D) sulla chiamata.
+    Dtmf { call: u16, digit: char },
 }
 
 // === stato interno ==========================================================
@@ -364,7 +395,8 @@ impl PbxClient {
             self.start_registration(now);
         }
 
-        // keepalive NAT: POKE periodico 
+        // keepalive NAT: POKE periodico (LEZIONE 5: tiene aperto il buco UDP,
+        // senza i POKE di qualify e i NEW in arrivo non rientrano).
         if self.reg_state == RegState::Registered && now >= self.next_keepalive {
             let poke = FullFrame::new(CALLNO_KEEPALIVE, 0, self.ts(), 0, 0, frametype::IAX, iax::POKE, vec![]).encode();
             self.push(poke);
@@ -379,14 +411,14 @@ impl PbxClient {
 
     fn start_registration(&mut self, now: Instant) {
         self.reg.reset();
-        self.calltoken = None; 
+        self.calltoken = None; // LEZIONE 2: token fresco a ogni ciclo
         self.reg_state = RegState::Registering;
         let ies = self.reg_ies();
         let f = self.reg.build(self.ts(), frametype::IAX, iax::REGREQ, ies);
         self.reg.track_reliable(&f, now);
         self.push(f.encode());
         self.next_reg = now + REG_GUARD; // guardia anti-spam
-        self.emit(Event::Log("REGREQ sended".into()));
+        self.emit(Event::Log("REGREQ inviato".into()));
     }
 
     fn retransmit_reg(&mut self, now: Instant) {
@@ -408,7 +440,7 @@ impl PbxClient {
             self.reg.outstanding.clear();
             self.reg_state = RegState::Idle;
             self.next_reg = now + REG_RETRY;
-            self.emit(Event::RegisterLost { reason: "No ACK after retransmissions".into() });
+            self.emit(Event::RegisterLost { reason: "nessun ACK dopo ritrasmissioni".into() });
         }
     }
 
@@ -438,7 +470,7 @@ impl PbxClient {
             self.push(b);
         }
         for local in dead {
-            self.drop_call(local, "trusting timeout".into());
+            self.drop_call(local, "timeout affidabilita'".into());
         }
     }
 
@@ -460,6 +492,7 @@ impl PbxClient {
             Command::Hold { call } => self.set_hold(call, true, now),
             Command::Unhold { call } => self.set_hold(call, false, now),
             Command::SendVoice { call, ulaw } => self.send_voice(call, &ulaw),
+            Command::Dtmf { call, digit } => self.send_dtmf(call, digit, now),
         }
     }
 
@@ -500,7 +533,25 @@ impl PbxClient {
             c.leg.track_reliable(&hb, now);
             self.push(hb.encode());
         }
-        self.drop_call(call, "local hangup".into());
+        self.drop_call(call, "riagganciato localmente".into());
+    }
+
+    fn send_dtmf(&mut self, call: u16, digit: char, now: Instant) {
+        // DTMF valido: 0-9, *, #, A-D (case-insensitive). Il subclass del frame
+        // DTMF porta la cifra come ASCII (compatibile con Asterisk).
+        let d = digit.to_ascii_uppercase();
+        if !(d.is_ascii_digit() || matches!(d, '*' | '#' | 'A'..='D')) {
+            return;
+        }
+        let ts = self.ts();
+        let bytes = self.calls.get_mut(&call).map(|c| {
+            let f = c.leg.build(ts, frametype::DTMF, d as u8, vec![]);
+            c.leg.track_reliable(&f, now);
+            f.encode()
+        });
+        if let Some(b) = bytes {
+            self.push(b);
+        }
     }
 
     fn set_hold(&mut self, call: u16, hold: bool, now: Instant) {
@@ -568,7 +619,10 @@ impl PbxClient {
         }
         let Some(f) = FullFrame::decode(dg) else { return };
 
-        
+        // 1) Qualify standalone: POKE/PING -> PONG.
+        //    LEZIONE 3: il PONG deve riecheggiare il timestamp del POKE, o
+        //    Asterisk calcola un RTT assurdo e ci marca UNREACHABLE.
+        //    Call number ROTANTE (punto D): niente NOTICE "Still have a callno".
         if f.frametype == frametype::IAX && (f.subclass == iax::POKE || f.subclass == iax::PING) {
             let src = self.next_qualify_callno();
             let pong = FullFrame::new(src, f.src_call, f.timestamp, 0, f.oseq.wrapping_add(1), frametype::IAX, iax::PONG, vec![]).encode();
@@ -576,6 +630,10 @@ impl PbxClient {
             return;
         }
 
+        // 2) Call-token pre-auth: instradalo verso la cosa in volo che lo
+        //    aspetta (registrazione o una chiamata uscente in Trying).
+        //    LEZIONE 1: rispedire la richiesta ORIGINALE fresca (oseq=0,
+        //    iseq=0, dst_call=0) con il token; NON imparare seq dal token.
         if let Some(tok) = ie::find(&f.ies, iet::CALLTOKEN) {
             if !tok.data.is_empty() {
                 let data = tok.data.clone();
@@ -602,7 +660,7 @@ impl PbxClient {
             return;
         }
 
-        // 4) Leg Routing.
+        // 4) Routing per gamba.
         if f.dst_call == self.reg.local {
             self.on_reg_frame(&f, now);
             return;
@@ -615,7 +673,7 @@ impl PbxClient {
         // 5) Fuori gamba: ACK/PONG/INVAL benigni -> silenzio.
         match (f.frametype, f.subclass) {
             (frametype::IAX, iax::ACK) | (frametype::IAX, iax::PONG) | (frametype::IAX, iax::INVAL) => {}
-            (ft, sc) => self.emit(Event::Log(format!("Out of leg frame dst_call={} ft=0x{ft:02x} sc=0x{sc:02x}", f.dst_call))),
+            (ft, sc) => self.emit(Event::Log(format!("frame fuori gamba dst_call={} ft=0x{ft:02x} sc=0x{sc:02x}", f.dst_call))),
         }
     }
 
@@ -686,11 +744,11 @@ impl PbxClient {
                 let methods = ie::find(&f.ies, iet::AUTHMETHODS).and_then(|i| i.as_u16()).unwrap_or(0);
                 let challenge = ie::find(&f.ies, iet::CHALLENGE).map(|i| i.as_str());
                 if methods & authmethod::MD5 == 0 {
-                    self.emit(Event::Log("REGAUTH without MD5".into()));
+                    self.emit(Event::Log("REGAUTH senza MD5".into()));
                     return;
                 }
                 let Some(chal) = challenge else {
-                    self.emit(Event::Log("REGAUTH without challenge".into()));
+                    self.emit(Event::Log("REGAUTH senza challenge".into()));
                     return;
                 };
                 let md5 = crate::md5_response(&chal, &self.cfg.secret);
@@ -759,11 +817,11 @@ impl PbxClient {
                 let methods = ie::find(&f.ies, iet::AUTHMETHODS).and_then(|i| i.as_u16()).unwrap_or(0);
                 let challenge = ie::find(&f.ies, iet::CHALLENGE).map(|i| i.as_str());
                 if methods & authmethod::MD5 == 0 {
-                    self.emit(Event::Log("AUTHREQ without MD5".into()));
+                    self.emit(Event::Log("AUTHREQ senza MD5".into()));
                     return;
                 }
                 let Some(chal) = challenge else {
-                    self.emit(Event::Log("AUTHREQ without challenge".into()));
+                    self.emit(Event::Log("AUTHREQ senza challenge".into()));
                     return;
                 };
                 let md5 = crate::md5_response(&chal, &self.cfg.secret);
@@ -813,7 +871,7 @@ impl PbxClient {
                     let ack = c.leg.ack_bytes(ts);
                     self.push(ack);
                 }
-                self.drop_call(local, "hangup by remote party".into());
+                self.drop_call(local, "chiusa dal remoto".into());
             }
             (frametype::IAX, iax::REJECT) => {
                 let code = ie::find(&f.ies, iet::CAUSECODE).and_then(|i| i.data.first().copied());
@@ -821,7 +879,7 @@ impl PbxClient {
                     let ack = c.leg.ack_bytes(ts);
                     self.push(ack);
                 }
-                self.drop_call(local, format!("refused causecode={code:?}"));
+                self.drop_call(local, format!("rifiutata causecode={code:?}"));
             }
             (frametype::IAX, iax::ACK) | (frametype::IAX, iax::PONG) => {}
             (frametype::IAX, iax::LAGRQ) => {
@@ -835,6 +893,14 @@ impl PbxClient {
                 }
             }
             (frametype::IAX, iax::LAGRP) => {} // risposta a una nostra LAGRQ (non inviata): assorbi
+            (frametype::DTMF, sc) => {
+                // cifra DTMF dal remoto: ACKa (full-frame) ed emetti l'evento
+                if let Some(c) = self.calls.get_mut(&local) {
+                    let ack = c.leg.ack_bytes(ts);
+                    self.push(ack);
+                }
+                self.emit(Event::Dtmf { call: local, digit: sc as char });
+            }
             (frametype::CNG, _) => {
                 // Comfort Noise: il capo remoto e' in silenzio (silence
                 // suppression/VAD attivo). sc = livello in -dBov, non e' audio.
@@ -892,7 +958,7 @@ mod tests {
     use crate::consts::{frametype, iax, ie as iec};
 
     fn cfg() -> Config {
-        Config::new("Test", "100", "segreto")
+        Config::new("Test", "10001", "segreto")
     }
 
     /// Decodifica l'ultimo datagramma full-frame uscito.
@@ -1071,6 +1137,39 @@ mod tests {
         assert_eq!(reconstruct_ts(0x0001_FFF0, 0x0010, true), 0x0002_0010);
         // riordino lieve all'indietro: ts16 poco prima del confine
         assert_eq!(reconstruct_ts(0x0002_0010, 0xFFF0, true), 0x0001_FFF0);
+    }
+
+    #[test]
+    fn dtmf_send_and_receive() {
+        let now = Instant::now();
+        let mut c = PbxClient::new(cfg());
+        c.reg_state = RegState::Registered;
+        // chiamata in ingresso + risposta -> Up, remote=42
+        let new = FullFrame::new(42, 0, 100, 0, 0, frametype::IAX, iax::NEW, vec![Ie::str(iec::CALLING_NUMBER, "200"), Ie::str(iec::CALLED_NUMBER, "10001")]);
+        c.handle_input(&new.encode(), now);
+        let call = std::iter::from_fn(|| c.poll_event())
+            .find_map(|e| if let Event::Incoming { call, .. } = e { Some(call) } else { None })
+            .expect("Incoming");
+        c.handle_command(Command::Answer { call }, now);
+        let _ = drain_full(&mut c);
+
+        // invio: '5' deve uscire come full-frame DTMF con subclass = b'5'
+        c.handle_command(Command::Dtmf { call, digit: '5' }, now);
+        let out = drain_full(&mut c);
+        let dtmf = out.iter().find(|f| f.frametype == frametype::DTMF).expect("frame DTMF");
+        assert_eq!(dtmf.subclass, b'5');
+
+        // cifra non valida: niente frame
+        c.handle_command(Command::Dtmf { call, digit: 'Z' }, now);
+        assert!(drain_full(&mut c).iter().all(|f| f.frametype != frametype::DTMF), "cifra invalida scartata");
+
+        // ricezione: un frame DTMF in ingresso emette Event::Dtmf
+        let rx = FullFrame::new(42, call, 200, 3, 3, frametype::DTMF, b'#', vec![]);
+        c.handle_input(&rx.encode(), now);
+        let got = std::iter::from_fn(|| c.poll_event())
+            .find_map(|e| if let Event::Dtmf { digit, .. } = e { Some(digit) } else { None })
+            .expect("Event::Dtmf");
+        assert_eq!(got, '#');
     }
 
     #[test]

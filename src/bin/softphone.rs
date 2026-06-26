@@ -125,6 +125,7 @@ impl App {
                 }
                 Event::Dtmf { call, digit } => println!("[#] [{name}] #{call} DTMF ricevuto: {digit}"),
                 Event::Log(s) => println!("[i] [{name}] {s}"),
+                _ => {}
             }
         }
     }

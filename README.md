@@ -19,6 +19,7 @@ without leaving the crate.
 
 > **New in 0.2.0:** Added DTMF support
 > **Fix in 0.2.1:** Fixed PING/PONG sequence numbers
+> **Fix in 0.2.2:** Fixed jitter misalignments( from "streak" to "leaky bucket" strategy )
 
 
 ## What works

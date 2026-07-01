@@ -27,6 +27,11 @@ const JITTER_K: f64 = 3.0;
 /// Tetto di frame bufferizzati (anti-crescita se nessuno fa pull): ~2 s.
 const MAX_FRAMES: usize = 100;
 
+const MISS_BUDGET_THRESHOLD: u32 = 60;
+const MISS_BUDGET_DECAY_ON_PLAY: u32 = 3;
+
+
+
 /// Esito di una richiesta di riproduzione.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pull {
@@ -60,6 +65,8 @@ pub struct JitterBuffer {
     concealed: u64,
     late: u64,
     overflow: u64,
+    miss_budget: u32,
+    // consec_concealed: u32,
 }
 
 impl Default for JitterBuffer {
@@ -81,6 +88,8 @@ impl JitterBuffer {
             concealed: 0,
             late: 0,
             overflow: 0,
+            miss_budget: 0,
+            //consec_concealed: 0,
         }
     }
 
@@ -89,6 +98,9 @@ impl JitterBuffer {
         self.frames.clear();
         self.playing = false;
         self.last_arrival = None;
+        self.jitter = 0.0;
+        self.target_ms = MIN_DEPTH_MS;
+        self.miss_budget = 0; 
     }
 
     /// Inserisce un frame ricevuto (ts in ms, payload grezzo).
@@ -115,6 +127,20 @@ impl JitterBuffer {
             return;
         }
 
+        // Risincronizzazione: se il cursore di playout e' rimasto indietro
+        // rispetto al flusso live di piu' del doppio della profondita' massima,
+        // non lo recuperera' mai (avanza di FRAME_MS a ogni pull, alla stessa
+        // velocita' con cui arrivano i nuovi frame: il divario e' costante).
+        // Forza un nuovo priming sul materiale fresco invece di scartare in
+        // Conceal/overflow all'infinito.
+        if self.playing {
+            let lag = ts as i64 - self.next_ts as i64;
+            if lag > (MAX_DEPTH_MS as i64) * 2 {
+                self.frames.clear();
+                self.playing = false;
+            }
+        }
+
         self.frames.insert(ts, payload);
 
         // anti-crescita: se nessuno consuma, butta i piu' vecchi
@@ -130,6 +156,7 @@ impl JitterBuffer {
 
     /// Estrae il prossimo frame da riprodurre (un passo da 20 ms).
     pub fn pull(&mut self) -> Pull {
+
         if !self.playing {
             // priming: aspetta di avere abbastanza buffer da coprire il target
             if self.buffered_span_ms() >= self.target_ms {
@@ -143,20 +170,64 @@ impl JitterBuffer {
             }
         }
 
+        if self.miss_budget > MISS_BUDGET_THRESHOLD {
+            if let Some((&newest, _)) = self.frames.iter().next_back() {
+                self.next_ts = newest;
+            }
+            self.miss_budget = 0;
+        }
+
+
         if let Some(payload) = self.frames.remove(&self.next_ts) {
             self.next_ts = self.next_ts.wrapping_add(FRAME_MS);
             self.played += 1;
+            self.miss_budget = self.miss_budget.saturating_sub(MISS_BUDGET_DECAY_ON_PLAY);
             Pull::Play(payload)
         } else if !self.frames.is_empty() {
-            // il frame atteso non c'e' ma ci sono frame futuri: buco -> PLC
             self.next_ts = self.next_ts.wrapping_add(FRAME_MS);
             self.concealed += 1;
+            self.miss_budget = self.miss_budget.saturating_add(1);
             Pull::Conceal
         } else {
-            // buffer esaurito: rifai priming al prossimo arrivo
             self.playing = false;
+            self.miss_budget = 0;
             Pull::Silence
         }
+
+        // if let Some(payload) = self.frames.remove(&self.next_ts) {
+        //    self.next_ts = self.next_ts.wrapping_add(FRAME_MS);
+        //    self.played += 1;
+        //    self.consec_concealed = 0;
+        //    Pull::Play(payload)
+        //} else if !self.frames.is_empty() {
+
+        //    self.consec_concealed += 1;
+            // Il cursore non recupera mai un gap persistente: Conceal avanza
+            // alla stessa velocita' con cui arrivano i frame nuovi, qualunque
+            // sia l'ampiezza del disallineamento. Dopo una serie troppo lunga
+            // di scarti consecutivi, rincancora il cursore sul frame piu'
+            // recente disponibile invece di continuare all'infinito.
+        //    const MAX_CONCEAL_STREAK: u32 = (MAX_DEPTH_MS / FRAME_MS) * 2; // ~400ms
+        //    if self.consec_concealed > MAX_CONCEAL_STREAK {
+        //        if let Some((&newest, _)) = self.frames.iter().next_back() {
+        //            self.next_ts = newest;
+        //        }
+        //        self.consec_concealed = 0;
+        //    }
+
+            // il frame atteso non c'e' ma ci sono frame futuri: buco -> PLC
+        //    self.next_ts = self.next_ts.wrapping_add(FRAME_MS);
+        //    self.concealed += 1;
+        //    Pull::Conceal
+        
+        
+        
+        //} else {
+            // buffer esaurito: rifai priming al prossimo arrivo
+        //    self.playing = false;
+        //    Pull::Silence
+        //}
+
     }
 
     pub fn stats(&self) -> Stats {
@@ -228,6 +299,81 @@ mod tests {
         assert_eq!(out, vec![0, 1, 2, 3], "riallineati per ts nonostante l'ordine d'arrivo");
     }
 
+    #[test]
+    fn resyncs_when_cursor_falls_permanently_behind() {
+    // Riproduce il bug osservato con softphone.rs: dopo il priming, il
+    // flusso reale "salta avanti" di molto (es. un errore di ricostruzione
+    // del timestamp a 16 bit sul lato IAX2). Senza risincronizzazione, il
+    // cursore (next_ts) rincorre a +FRAME_MS per pull mentre i nuovi
+    // arrivi continuano ad allontanarsi alla stessa velocita': non lo
+    // raggiunge mai, ed e' silenzio permanente (Conceal/overflow
+    // all'infinito), esattamente come nel log reale (played fermo per 9s
+    // mentre concealed/overflow salivano in lockstep).
+    let t0 = Instant::now();
+    let mut jb = JitterBuffer::new();
+
+    // Fase A: priming normale, 5 frame consecutivi -> played consuma solo
+    // il primo, next_ts resta a 20.
+    for i in 0..5u32 {
+        jb.push(i * FRAME_MS, pcm(i as u8), t0 + Duration::from_millis((i * 20) as u64));
+    }
+    assert!(matches!(jb.pull(), Pull::Play(_)), "priming completato, primo frame riprodotto");
+
+    // Fase B: il flusso vero salta ben oltre la soglia di resync (doppio
+    // di MAX_DEPTH_MS). Senza il fix questi frame finirebbero tutti
+    // legittimi in coda dietro un cursore che non li raggiungera' mai.
+    let jump = 20 + MAX_DEPTH_MS * 3;
+    for k in 0..5u32 {
+        let ts = jump + k * FRAME_MS;
+        jb.push(ts, pcm(100 + k as u8), t0 + Duration::from_millis(1000 + (k * 20) as u64));
+    }
+
+    let mut played = Vec::new();
+    for _ in 0..5 {
+        if let Pull::Play(p) = jb.pull() {
+            played.push(p[0]);
+        }
+    }
+    assert!(!played.is_empty(), "dopo il resync il buffer deve riprendere a riprodurre, non restare bloccato in Conceal/Silence per sempre");
+    assert_eq!(played[0], 100, "riparte dal primo frame del cluster fresco, non da un vecchio frame stantio rimasto in coda");
+    assert_eq!(played, vec![100, 101, 102, 103, 104], "tutto il cluster fresco viene riprodotto in ordine dopo il resync");
+    }
+
+    #[test]
+    fn recovers_from_small_persistent_gap_via_conceal_streak() {
+        // Riproduce il caso softphone.rs reale: un disallineamento PICCOLO
+        // (sotto la soglia di resync su push, quindi quel fix da solo non
+        // basta) ma persistente. Senza la rete di sicurezza sul lato pull(),
+        // il cursore non lo recupera mai: Conceal avanza alla stessa velocita'
+        // con cui arrivano i nuovi frame, il gap resta costante per sempre.
+        let t0 = Instant::now();
+        let mut jb = JitterBuffer::new();
+
+        for i in 0..5u32 {
+            jb.push(i * FRAME_MS, pcm(i as u8), t0 + Duration::from_millis((i * 20) as u64));
+        }
+        assert!(matches!(jb.pull(), Pull::Play(_)));
+        // next_ts = 20 dopo il primo pull
+
+        // gap piccolo e persistente: 150ms, sotto la soglia di resync su push
+        // (400ms), ma che Conceal non potra' mai chiudere da solo.
+        let gap_start = 20 + 150;
+        for k in 0..60u32 {
+            let ts = gap_start + k * FRAME_MS;
+            jb.push(ts, pcm(200), t0 + Duration::from_millis(1000 + (k * 20) as u64));
+        }
+
+        let mut saw_play_again = false;
+        for _ in 0..60 {
+            if matches!(jb.pull(), Pull::Play(_)) {
+                saw_play_again = true;
+                break;
+            }
+        }
+        assert!(saw_play_again, "il buffer deve riprendere a riprodurre entro la soglia di streak, non restare bloccato in Conceal per sempre");
+    }
+
+
     // un frame mancante in mezzo produce un Conceal, poi prosegue.
     #[test]
     fn gap_yields_conceal() {
@@ -276,5 +422,36 @@ mod tests {
             jb.push(n as u32 * FRAME_MS, pcm(n as u8), t0 + Duration::from_millis(a));
         }
         assert!(jb.stats().target_ms > MIN_DEPTH_MS, "il target si adatta al jitter");
+    }
+
+    #[test]
+    fn resyncs_on_sustained_partial_misalignment_even_with_sporadic_hits() {
+        // Riproduce il caso reale: non uno streak ininterrotto di Conceal, ma
+        // un flusso dove Play e Conceal/late si alternano, con i miss in
+        // minoranza numerica dominante. Un contatore a streak puro (azzerato
+        // da ogni singolo Play) non lo riconoscerebbe mai come problema.
+        let t0 = Instant::now();
+        let mut jb = JitterBuffer::new();
+
+        for i in 0..5u32 {
+            jb.push(i * FRAME_MS, pcm(i as u8), t0 + Duration::from_millis((i * 20) as u64));
+        }
+        assert!(matches!(jb.pull(), Pull::Play(_)));
+
+        // 80 round: ogni round un push leggermente disallineato (crea Conceal
+        // o late alternati a qualche Play fortuito), mai un salto isolato
+        // grande, mai uno streak ininterrotto.
+        let mut saw_play = 0usize;
+        let mut saw_conceal_or_late = 0usize;
+        for k in 0..80u32 {
+            let ts = 20 + 60 + k * FRAME_MS; // disallineamento persistente ~60ms
+            jb.push(ts, pcm(200), t0 + Duration::from_millis(1000 + (k * 20) as u64));
+            match jb.pull() {
+                Pull::Play(_) => saw_play += 1,
+                Pull::Conceal => saw_conceal_or_late += 1,
+                Pull::Silence => {}
+            }
+        }
+        assert!(saw_play > 40, "dopo il resync la maggioranza dei pull deve tornare a essere Play, non restare bloccata a meta' strada (Play={saw_play}, Conceal={saw_conceal_or_late})");
     }
 }

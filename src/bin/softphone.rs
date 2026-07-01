@@ -43,6 +43,7 @@ struct App {
     jb: JitterBuffer,
     /// Ultimo frame PCM riprodotto, per il packet-loss concealment.
     last_pcm: Vec<i16>,
+    jb_log_tick: u32,
 }
 
 impl App {
@@ -81,12 +82,15 @@ impl App {
                 }
                 Event::Voice { call, ts, ulaw } => {
                     if self.active == Some((idx, call)) {
+                        // eprintln!("[voice-in] ts={} len={}", ts, ulaw.len());
                         self.jb.push(ts, ulaw, Self::now());
                     }
                 }
                 Event::Ended { call, reason } => {
                     println!("[i] [{name}] #{call} ended: {reason}");
                     if self.active == Some((idx, call)) {
+                        let st = self.jb.stats();
+                        eprintln!("[jb@end] target_ms={} jitter_stats={:?}", st.target_ms, st);
                         self.active = None;
                         self.jb.reset();
                         self.last_pcm.clear();
@@ -324,7 +328,7 @@ async fn main() {
     }
     drop(tx);
 
-    let mut app = App { clients, sockets, audio, active: None, selected: 0, jb: JitterBuffer::new(), last_pcm: Vec::new() };
+    let mut app = App { clients, sockets, audio, active: None, selected: 0, jb: JitterBuffer::new(), last_pcm: Vec::new(), jb_log_tick: 0 };
 
     println!("[i] READY.");
     println!("[i] --------------------------------------------");
@@ -380,6 +384,13 @@ async fn main() {
                     app.flush_tx(idx).await;
                 }
                 app.pump_playout();
+                app.jb_log_tick += 1;
+                if app.jb_log_tick % 50 == 0 {          // ogni ~1s (50 tick × 20ms)
+                    let st = app.jb.stats();
+                    eprintln!("[jb] played={} concealed={} late={} overflow={} target_ms={} buffered={}",
+                    st.played, st.concealed, st.late, st.overflow, st.target_ms, st.buffered
+                    );
+                }
             }
 
             // tastiera

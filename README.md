@@ -22,6 +22,7 @@ without leaving the crate.
 > **Fix in 0.2.2:** Fixed jitter misalignments( from "streak" to "leaky bucket" strategy )
 
 
+
 ## What works
 
 - **Registration** with call-token pre-authentication and MD5 challenge/response

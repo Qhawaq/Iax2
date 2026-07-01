@@ -18,6 +18,7 @@ without leaving the crate.
 > support is intentionally narrow (see [Scope](#scope-and-limitations)).
 
 > **New in 0.2.0:** Added DTMF support
+> **Fix in 0.2.1:** Fixed PING/PONG sequence numbers
 
 
 ## What works

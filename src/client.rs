@@ -608,7 +608,7 @@ impl PbxClient {
         let Some(f) = FullFrame::decode(dg) else { return };
 
         // 1) Qualify standalone: POKE/PING -> PONG.
-        if f.frametype == frametype::IAX && (f.subclass == iax::POKE || f.subclass == iax::PING) {
+        if f.frametype == frametype::IAX && (f.subclass == iax::POKE || f.subclass == iax::PING) && f.dst_call == 0 {
             let src = self.next_qualify_callno();
             let pong = FullFrame::new(src, f.src_call, f.timestamp, 0, f.oseq.wrapping_add(1), frametype::IAX, iax::PONG, vec![]).encode();
             self.push(pong);
@@ -874,6 +874,14 @@ impl PbxClient {
                     self.push(lagrp.encode());
                 }
             }
+            
+            (frametype::IAX, iax::PING) => {
+                if let Some(c) = self.calls.get_mut(&local) {
+                let pong = c.leg.build(f.timestamp, frametype::IAX, iax::PONG, vec![]);
+                self.push(pong.encode());
+                }
+            }
+
             (frametype::IAX, iax::LAGRP) => {} // risposta a una nostra LAGRQ (non inviata): assorbi
             (frametype::DTMF, sc) => {
                 // cifra DTMF dal remoto: ACKa (full-frame) ed emetti l'evento
@@ -1108,6 +1116,62 @@ mod tests {
         // call number rotante: non sempre lo stesso (niente NOTICE)
         assert!(seen[0] != seen[1] || seen[1] != seen[2], "il callno del PONG ruota");
     }
+
+    #[test]
+    fn in_call_ping_gets_pong_on_active_call_not_new_callno() {
+        // Riproduce il bug: Asterisk manda PING con dst_call = scall locale
+        // della call attiva (18 nel log reale). Il client NON deve cadere nel
+        // ramo del qualify standalone (che alloca un nuovo scall rotante), ma
+        // deve rispondere PONG sulla stessa call, con SCall=locale e
+        // DCall=remoto, riecheggiando il timestamp — esattamente come fa già
+        // per LAGRQ/LAGRP.
+        let now = Instant::now();
+        let mut c = PbxClient::new(cfg());
+        c.reg_state = RegState::Registered;
+
+        // stabilisci una call in ingresso, portala a Up (come in
+        // incoming_call_rings_then_answers_then_audio)
+        let new = FullFrame::new(
+            42,
+            0,
+            100,
+            0,
+            0,
+            frametype::IAX,
+            iax::NEW,
+            vec![Ie::str(iec::CALLING_NUMBER, "200"), Ie::str(iec::CALLED_NUMBER, "10001")],
+        );
+        c.handle_input(&new.encode(), now);
+        let _ = drain_full(&mut c);
+        let call = match c.poll_event() {
+            Some(Event::Incoming { call, .. }) => call,
+            other => panic!("atteso Incoming, trovato {other:?}"),
+        };
+        c.handle_command(Command::Answer { call }, now);
+        let _ = drain_full(&mut c);
+        let _ = std::iter::from_fn(|| c.poll_event()).count();
+        assert_eq!(c.call_state(call), Some(CallState::Up));
+
+        let local_before = c.calls[&call].leg.local; // scall nostro reale (es. 18)
+        let remote = c.calls[&call].leg.remote; // scall di Asterisk per questa call (42)
+
+        // PING in-call: dst_call = il nostro scall reale, non 0.
+        let ping = FullFrame::new(remote, local_before, 5000, 3, 4, frametype::IAX, iax::PING, vec![]);
+        c.handle_input(&ping.encode(), now);
+        let out = drain_full(&mut c);
+
+        let pong = out.iter().find(|f| f.subclass == iax::PONG).expect("PONG in risposta al PING in-call");
+        assert_eq!(pong.timestamp, 5000, "il PONG riecheggia il ts del PING");
+        assert_eq!(pong.src_call, local_before, "SCall del PONG = scall locale della call attiva, non un nuovo callno");
+        assert_eq!(pong.dst_call, remote, "DCall del PONG = scall del peer");
+
+        // la call non deve essere toccata/duplicata: stesso local, ancora Up
+        assert_eq!(c.calls.len(), 1, "nessuna call fantasma creata dal PING");
+        assert_eq!(c.calls[&call].leg.local, local_before, "lo scall locale della call non cambia");
+        assert_eq!(c.call_state(call), Some(CallState::Up), "la call resta Up");
+    }
+
+
 
     #[test]
     fn reconstruct_ts_handles_wrap() {
